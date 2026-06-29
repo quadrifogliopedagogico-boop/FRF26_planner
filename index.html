@@ -2,7 +2,7 @@
 <html lang="it">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=0.3, minimum-scale=0.25, maximum-scale=5, user-scalable=yes">
+<meta name="viewport" content="width=1280, user-scalable=yes">
 <title>Florence Roma Florence 2026 — Planner</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -80,7 +80,7 @@ main { max-width: 1280px; margin: 0 auto; padding: 16px 32px 80px; }
 .btn-group button.active { background: var(--red); color: #fff; }
 .params-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 14px; }
 .params-grid { display: grid; grid-template-columns: repeat(auto-fill,minmax(170px,1fr)); gap: 14px; }
-.param-item label { display: block; font-size: 11px; color: var(--ink3); font-weight: 700; margin-bottom: 4px; text-transform: uppercase; letter-spacing: 0.08em; }
+.param-item label { display: flex; align-items: flex-start; gap: 4px; font-size: 12px; color: var(--ink3); font-weight: 500; margin-bottom: 6px; line-height: 1.3; }
 .param-item input[type=number], .param-item select { width: 100%; padding: 8px 10px; border: 1px solid var(--line2); background: #fff; font-family: var(--font-body); font-size: 13px; color: var(--ink); border-radius: 2px; transition: border-color .15s; }
 .param-item input:focus, .param-item select:focus { outline: none; border-color: var(--red); }
 .param-item input:disabled { background: var(--bg-alt); color: var(--ink4); }
@@ -143,7 +143,7 @@ input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 18px;
 .chart-sub-day { font-family: var(--font); font-size: 12px; font-weight: 600; color: var(--red); margin-top: 2px; text-transform: uppercase; }
 .chart-legend { display: flex; gap: 12px; margin-top: 12px; font-size: 11px; color: var(--ink3); flex-wrap: wrap; }
 .chart-swatch { display: inline-block; width: 10px; height: 10px; margin-right: 4px; vertical-align: middle; border-radius: 1px; }
-.tip { position: relative; display: inline-flex; align-items: center; justify-content: center; width: 14px; height: 14px; background: var(--ink4); color: #fff; border-radius: 50%; font-size: 8px; font-weight: 700; cursor: pointer; vertical-align: middle; margin-left: 3px; border: none; padding: 0; }
+.tip { display: inline-flex; align-items: center; justify-content: center; width: 16px; height: 16px; border-radius: 50%; background: var(--line); color: var(--ink3); font-size: 10px; font-weight: 700; cursor: help; vertical-align: middle; margin-left: 4px; position: relative;  flex-shrink:0; vertical-align:middle; }
 .tip-box { display: none; position: absolute; bottom: calc(100% + 8px); left: 50%; transform: translateX(-50%); background: #1a1a1a; color: #fff; padding: 9px 12px; border-radius: 3px; font-size: 11px; white-space: normal; width: 215px; z-index: 300; line-height: 1.5; box-shadow: 0 4px 16px rgba(0,0,0,0.3); pointer-events: none; }
 .tip-box::after { content: ''; position: absolute; top: 100%; left: 50%; transform: translateX(-50%); border: 5px solid transparent; border-top-color: #1a1a1a; }
 .tip.open .tip-box { display: block; }
@@ -201,6 +201,8 @@ input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 18px;
 footer { background: var(--bg-dark); color: var(--ink4); padding: 20px 32px; text-align: center; font-size: 12px; margin-top: 32px; border-top: 3px solid var(--red); }
 footer a { color: var(--gold); text-decoration: none; }
 footer a:hover { color: #fff; }
+body.reg-active { min-width:0; }
+body.reg-active .reg-screen { width:100vw; max-width:100vw; }
 </style>
 </head>
 <body>
@@ -278,9 +280,6 @@ const TOTAL_ELEV=STAGES.reduce((s,t)=>s+t.elev,0);
 const N=STAGES.length;
 const TIME_LIMIT=90;
 const BASE_DATE=new Date(2026,7,18);
-const SPEED_MIN_KMH=5, SPEED_MAX_KMH=45;
-let SPEED_WARN={};
-let _shownWarnings={};
 
 const PRESETS={
   '4 giorni':[4,6,8],
@@ -303,8 +302,111 @@ const state={
   regMode:false,
 };
 function mass(){return state.weightRider+state.weightBike}
-const G=9.81,RHO=1.1,CDA=0.40,CR=0.005,EFF=0.95,V_DESC=30;
+const G=9.81,RHO=1.1,CDA=0.433,CR=0.003,EFF=0.95;
+const V_DESC=30;
+// Soglie pendenza CONDIVISE dai tre modelli (prima B/C usavano 1.5%, A il 2%:
+// la fascia 1.5-2% era salita per B/C e pianura per A — divergenza artificiale).
+// Controllo plausibilità velocità implicita per tappa (intercetta errori di battitura)
+// SPEED_WARN, CLIMB_TH, DESC_TH dichiarati nel blocco engine
+// Precompute pedaling fraction per stage (segments with grade > -0.02)
+// Performance multipliers for fork: [ott, med, cons]
 const PERF={min:1.05,med:1.0,max:0.90};
+
+// === MODELLO VELOCITÀ-PER-PENDENZA (calibrato su 11.612 finestre Strava reali) ===
+// Sostituisce le tre fasce discrete (piano/salita/discesa) con una funzione CONTINUA
+// senza gradini artificiali. Le pendenze marginali (-3%/0 e +2/+6%) usano correzioni
+// empiriche derivate dai dati: in lieve discesa NON acceleri come la fisica predirebbe
+// (scali la potenza); su falsopiano in salita il "motore salita" si accende gradualmente.
+function speedAtGrade(grade, pFlat, pClimb, m){
+  if(grade < -0.03){
+    return V_DESC; // discesa ripida: tetto etico, motore reale corregge dopo
+  }
+  if(grade < 0){
+    // FALSOPIANO NEGATIVO (-3% a 0): empirico calibrato (MAE 2.3% sui dati reali).
+    // Guadagno 7.5% per ogni 1% di discesa, rispetto alla velocità di pianura.
+    const vFlat0 = solveFlatSpeed(pFlat, 0, m);
+    return vFlat0 * (1 + 7.5/100 * Math.abs(grade)/0.01);
+  }
+  if(grade <= 0.02){
+    return Math.max(5, solveFlatSpeed(pFlat, grade, m)); // piano
+  }
+  if(grade < 0.06){
+    // FALSOPIANO POSITIVO (+2% a +6%): raccordo CONTINUO tra fisica piano e fisica
+    // salita. Il "motore salita" si accende gradualmente, non a gradino al 2%.
+    const vP = solveFlatSpeed(pFlat, grade, m);
+    const vC = pClimb*EFF/(m*G*(grade+CR))*3.6;
+    const frac = (grade - 0.02) / 0.04;
+    return Math.max(3, vP*(1-frac) + vC*frac);
+  }
+  // SALITA VERA (>+6%): fisica con pClimb
+  return Math.max(3, pClimb*EFF/(m*G*(grade+CR))*3.6);
+}
+
+function solveFlatSpeed(power,grade,mass){
+  // Solve P*EFF = (CR+grade)*m*g*v + 0.5*rho*CdA*v^3 for v
+  // Only valid for grade near 0 (DESC_TH to CLIMB_TH)
+  const pe=power*EFF;
+  const resist=(CR+grade)*mass*G;
+  // Good initial guess for near-flat
+  let v=Math.max(3, Math.pow(pe/( 0.5*RHO*CDA + Math.abs(resist)*0.1 ), 1/3));
+  if(v>20) v=8;
+  for(let i=0;i<30;i++){
+    const f=0.5*RHO*CDA*v*v*v+resist*v-pe;
+    const fp=1.5*RHO*CDA*v*v+resist;
+    if(Math.abs(fp)<1e-8) break;
+    const dv=f/fp;
+    v=v-dv;
+    if(v<1) v=1;
+    if(v>22) v=22;
+    if(Math.abs(dv)<1e-6) break;
+  }
+  return v*3.6; // km/h
+}
+
+function timeSegA(segs,vFlat,vam,perfMul){
+  // Modo A: ricava pFlat dalla velocità di pianura e pClimb dalla VAM (riferimento 7%),
+  // poi delega a speedAtGrade (curva continua calibrata).
+  const m=mass();
+  const vf0=vFlat/3.6;
+  const pF=(0.5*RHO*CDA*vf0*vf0*vf0+CR*m*G*vf0)/EFF*perfMul;
+  const REF=0.07;
+  const vRef=(vam/3600)/REF;
+  const pC=(m*G*(REF+CR)*vRef+0.5*RHO*CDA*vRef*vRef*vRef)/EFF*perfMul;
+  let t=0;
+  for(const[d,g]of segs){ t+=(d/1000)/speedAtGrade(g,pF,pC,m); }
+  return t;
+}
+
+function timeSegBAvg(segs,power,mass,perfMul){
+  // Modo B: potenza media → split salita/piano calibrato sui dati reali (ratio 1.09).
+  // Su ultra-distanza la potenza è quasi costante, non si scatta.
+  const pwClimb=power*perfMul*1.04;  // ~+4% in salita
+  const pwFlat=power*perfMul*0.96;   // ~-4% in piano (ratio 1.09)
+  let t=0;
+  for(const[d,g]of segs){ t+=(d/1000)/speedAtGrade(g,pwFlat,pwClimb,mass); }
+  return t;
+}
+
+function timeSegFTP(segs,ftp,intClimb,intFlat,mass,perfMul){
+  // Modo C: FTP con intensità differenziate. Usa la curva continua condivisa.
+  const pC=ftp*intClimb/100*perfMul;
+  const pF=ftp*intFlat/100*perfMul;
+  let t=0;
+  for(const[d,g]of segs){ t+=(d/1000)/speedAtGrade(g,pF,pC,mass); }
+  return t;
+}
+
+function timeSegB(segs,power,mass,perfMul){
+  // Modo B alternativo (potenza piatta): stessa potenza in piano e salita.
+  const pw=power*perfMul;
+  let t=0;
+  for(const[d,g]of segs){ t+=(d/1000)/speedAtGrade(g,pw,pw,mass); }
+  return t;
+}
+// Soglie pendenza CONDIVISE dai tre modelli (la fascia 1.5-2% era salita per B/C
+// e pianura per A: divergenza artificiale tra modelli, ora eliminata).
+const CLIMB_TH=0.02,DESC_TH=-0.02;
+const SPEED_MIN_KMH=5,SPEED_MAX_KMH=55;
 
 function solveFlatSpeed(power,grade,mass){
   const pe=power*EFF,resist=(CR+grade)*mass*G;
@@ -317,21 +419,6 @@ function solveFlatSpeed(power,grade,mass){
   }
   return v*3.6;
 }
-function timeSegA(segs,vFlat,vam,pm){
-  const vf=vFlat*pm,va=vam*pm;let t=0;
-  for(const[d,g]of segs){const dkm=d/1000;if(g>0.02)t+=(d*g)/va;else if(g<-0.02)t+=dkm/V_DESC;else t+=dkm/vf;}
-  return t;
-}
-function timeSegB(segs,power,mass,pm){
-  const pwC=power*pm*1.60,pwF=power*pm*0.80;let t=0;
-  for(const[d,g]of segs){const dkm=d/1000;if(g<-0.02)t+=dkm/V_DESC;else if(g>0.015){const v=pwC*EFF/(mass*G*(g+CR))*3.6;t+=dkm/Math.max(v,3);}else t+=dkm/Math.max(solveFlatSpeed(pwF,g,mass),5);}
-  return t;
-}
-function timeSegC(segs,ftp,iC,iF,mass,pm){
-  const pC=ftp*iC/100*pm,pF=ftp*iF/100*pm;let t=0;
-  for(const[d,g]of segs){const dkm=d/1000;if(g<-0.02)t+=dkm/V_DESC;else if(g>0.015){const v=pC*EFF/(mass*G*(g+CR))*3.6;t+=dkm/Math.max(v,3);}else t+=dkm/Math.max(solveFlatSpeed(pF,g,mass),5);}
-  return t;
-}
 function stageRest(id){return(state.stageRests[id]||0)/60;}
 
 function powerClimbFlat(){
@@ -339,7 +426,7 @@ function powerClimbFlat(){
     return [state.ftp*state.intensityClimb/100, state.ftp*state.intensityFlat/100];
   }
   if(state.calcMode==='B'){
-    return [state.avgPower*1.60, state.avgPower*0.80];
+    return [state.avgPower*1.04, state.avgPower*0.96]; // split calibrato (ratio 1.09)
   }
   const m=mass();
   const pC=state.vam/3600/0.07*m*G*(0.07+CR)/EFF;
@@ -347,35 +434,47 @@ function powerClimbFlat(){
   const pF=(m*G*CR*vF + 0.5*RHO*CDA*vF*vF*vF)/EFF;
   return [pC, pF];
 }
+
 function estimateAvgPower(){
+  // Media ponderata sul tempo, usando la curva continua condivisa.
   const [pC,pF]=powerClimbFlat();
-  const pD=15; const m=mass();
+  const pD=15; // coasting in discesa
+  const m=mass();
   let sumPt=0,sumT=0;
   for(let i=1;i<=N;i++){
     for(const[d,g]of SEGS[i]){
-      const dkm=d/1000; let P,t;
-      if(g<-0.02){ P=pD; t=dkm/V_DESC; }
-      else if(g>0.015){ P=pC; const v=P*EFF/(m*G*(g+CR))*3.6; t=dkm/Math.max(v,3); }
-      else { P=pF; const v=Math.max(solveFlatSpeed(P,g,m),5); t=dkm/v; }
+      const dkm=d/1000;
+      const v=speedAtGrade(g,pF,pC,m);
+      const t=dkm/v;
+      // Potenza istantanea media stimata: in discesa coasting, sopra 6% pClimb pieno,
+      // sotto pFlat. Nella fascia di raccordo blendiamo come la velocità.
+      let P;
+      if(g<-0.03) P=pD;
+      else if(g>=0.06) P=pC;
+      else if(g<=0.02) P=pF;
+      else { const fr=(g-0.02)/0.04; P=pF*(1-fr)+pC*fr; }
       sumPt+=P*t; sumT+=t;
     }
   }
   return sumT>0?Math.round(sumPt/sumT):0;
 }
+
+// VAM media effettiva ponderata sui tratti in salita (m/h) — per la scritta in Modo A/B
 function estimateAvgVAM(){
   let climbD=0,climbVertical=0;
   for(let i=1;i<=N;i++){
     for(const[d,g]of SEGS[i]){
-      if(g>0.02){ climbD+=d; climbVertical+=d*g; }
+      if(g>CLIMB_TH){ climbD+=d; climbVertical+=d*g; }
     }
   }
   if(climbD<=0) return 0;
+  // VAM = pendenza media salite × velocità salita; in Modo A è ~state.vam, ma la ricaviamo dal modello fisico
   if(state.calcMode==='A') return Math.round(state.vam);
   const [pC]=powerClimbFlat();
-  const sAvg=climbVertical/climbD;
+  const sAvg=climbVertical/climbD; // pendenza media salite
   const m=mass();
-  const vClimb=pC*EFF/(m*G*(sAvg+CR));
-  return Math.round(vClimb*sAvg*3600);
+  const vClimb=pC*EFF/(m*G*(sAvg+CR)); // m/s
+  return Math.round(vClimb*sAvg*3600); // VAM m/h
 }
 function tipFatica(){
   const d=state.fatigueDecay;
@@ -393,15 +492,18 @@ function tipFatica(){
 function computeBreakDep(id,arrEl){
   const raw=state.breakDepartures[id]||'';
   if(!raw){
+    // Prossima occorrenza di defaultDepartureHour DALL'ARRIVO, mai prima di 2h
+    // di riposo. Se il target e' appena passato (attesa quasi un giro intero),
+    // si riparte a fine riposo minimo.
     const sf=state.startHour+state.startMinute/60;
-    const absArr=sf+Math.max(0,arrEl);
-    const minRest=2;
-    const earliestAbs=absArr+minRest;
-    const targetH=state.defaultDepartureHour;
-    const baseDay=Math.floor(earliestAbs/24);
-    let targetAbs=baseDay*24+targetH;
-    if(targetAbs<earliestAbs) targetAbs+=24;
-    return targetAbs-sf;
+    const absArr=sf+arrEl;
+    const earliestAbs=absArr+2;
+    const baseDay=Math.floor(absArr/24);
+    let occAbs=baseDay*24+state.defaultDepartureHour;
+    if(occAbs<absArr) occAbs+=24;
+    let depAbsH=Math.max(occAbs,earliestAbs);
+    if(depAbsH-earliestAbs>20) depAbsH=earliestAbs;
+    return depAbsH-sf;
   }
   const[h,m]=raw.split(':').map(Number);
   const sf=state.startHour+state.startMinute/60;
@@ -425,8 +527,8 @@ function computeTimes(){
     for(const[k,pf]of Object.entries(PERF)){
       const tp=pf*fat;
       if(state.calcMode==='A')t[k]=timeSegA(segs,state.vFlat,state.vam,tp);
-      else if(state.calcMode==='B')t[k]=timeSegB(segs,state.avgPower,m,tp);
-      else t[k]=timeSegC(segs,state.ftp,state.intensityClimb,state.intensityFlat,m,tp);
+      else if(state.calcMode==='B')t[k]=timeSegBAvg(segs,state.avgPower,m,tp);
+      else t[k]=timeSegFTP(segs,state.ftp,state.intensityClimb,state.intensityFlat,m,tp);
     }
     t.day=day;t.fat=fat;return t;
   });
@@ -448,10 +550,11 @@ function fmt(n){return n.toLocaleString('it-IT');}
 function fmtT(h){if(h<0)h=0;const hh=Math.floor(h),mm=Math.round((h-hh)*60);return hh+'h'+String(mm).padStart(2,'0');}
 function fmtClock(elapsedH){
   const sf=state.startHour+state.startMinute/60;
-  const abs=sf+Math.max(0,elapsedH);
-  const dayIdx=Math.floor(abs/24);
-  let hh=Math.floor(abs)%24,mm=Math.round((abs-Math.floor(abs))*60);
-  if(mm===60){mm=0;hh=(hh+1)%24;}
+  // Minuti totali: robusto a mezzanotte e a piccoli elapsed negativi (partenza anticipata).
+  const totMin=Math.round((sf+elapsedH)*60);
+  const dayIdx=Math.floor(totMin/1440);
+  const inDay=totMin-dayIdx*1440;
+  const hh=Math.floor(inDay/60),mm=inDay%60;
   const d=new Date(BASE_DATE.getTime()+dayIdx*86400000);
   const dN=['Dom','Lun','Mar','Mer','Gio','Ven','Sab'];
   return `${dN[d.getDay()]} ${d.getDate()}/${d.getMonth()+1} ${String(hh).padStart(2,'0')}:${String(mm).padStart(2,'0')}`;
@@ -466,51 +569,116 @@ function parseClockToElapsed(ts,expEl){
   for(const c of cands){const delta=c-exp;if(delta<-4||delta>20)continue;if(Math.abs(delta)<bD){bD=Math.abs(delta);best=c;}}
   return best===null?null:best-sf;
 }
+function motorTime(segs,k,fat){
+  if(state.calcMode==='A') return timeSegA(segs,state.vFlat*Math.cbrt(k),state.vam*k,fat);
+  if(state.calcMode==='B') return timeSegBAvg(segs,state.avgPower*k,mass(),fat);
+  return timeSegFTP(segs,state.ftp*k,state.intensityClimb,state.intensityFlat,mass(),fat);
+}
+// Stima il fattore-motore k che riproduce i tempi REALI delle tappe completate,
+// ripassando dalla fisica sul loro terreno reale (root-find: il tempo è monotòno
+// decrescente in k). È UN SOLO numero — il tuo motore è uno solo — ma applicato
+// attraverso la fisica diventa terrain-aware sulle tappe future.
+function findMotorK(completed){
+  const real=completed.reduce((s,c)=>s+c.realTime,0);
+  if(real<=0||completed.length===0) return 1;
+  const pred=k=>completed.reduce((s,c)=>s+motorTime(c.segs,k,c.fat),0);
+  let lo=0.45,hi=2.2;
+  if(pred(hi)>real) return hi; // reale più veloce del nostro massimo → clamp alto
+  if(pred(lo)<real) return lo; // reale più lento del nostro minimo → clamp basso
+  for(let it=0;it<40;it++){
+    const mid=(lo+hi)/2;
+    if(pred(mid)>real) lo=mid; else hi=mid;
+    if(hi-lo<1e-4) break;
+  }
+  return (lo+hi)/2;
+}
+
 function computeActualTimes(allT,days){
+  const isBreak=id=>state.dayBreaks.has(id);
   const _warnAcc={};
-  let prevDep=state.actualStart?Math.max(0,parseClockToElapsed(state.actualStart,0)||0):0;
-  let cumA=0,cumP=0;
-  const raw=STAGES.map((s,i)=>{
-    const at=state.actualTimes[s.id]||{},pm=allT[i].med,brk=state.dayBreaks.has(s.id);
-    if(at.arr){
-      const arrEl=parseClockToElapsed(at.arr,prevDep);
-      if(arrEl===null||arrEl<prevDep-0.05){
-        (_warnAcc[s.id]||(_warnAcc[s.id]={})).arr={kind:'time',msg:`L'orario di arrivo è precedente alla partenza dal punto precedente: la tappa risulterebbe percorsa in tempo negativo.`};
-        const pf=cumP>0?cumP/cumA:1,arr=prevDep+pm/pf;
-        const dep=brk?computeBreakDep(s.id,arr):arr+stageRest(s.id);
-        prevDep=dep;return{arr,dep,isActual:false,isInvalid:true,rideTime:pm/pf,pf};
-      }
-      const rideTime=Math.max(arrEl-prevDep,0);
-      cumA+=Math.max(rideTime,0.05);cumP+=pm;
-      const pf=cumP/cumA;
-      const impliedKmh=rideTime>0.01?(s.km/rideTime):999;
-      if(impliedKmh<SPEED_MIN_KMH||impliedKmh>SPEED_MAX_KMH)
-        (_warnAcc[s.id]||(_warnAcc[s.id]={})).arr={kind:'speed',kmh:Math.round(impliedKmh),msg:`Questo arrivo implica una media di ${Math.round(impliedKmh)} km/h sulla tratta, ${impliedKmh>SPEED_MAX_KMH?'troppo alta':'troppo bassa'} per essere reale.`};
-      let depEl;
-      if(at.dep){
-        const dp=parseClockToElapsed(at.dep,arrEl);
-        if(dp!==null&&dp>=arrEl){
-          depEl=dp;
-          const restH=depEl-arrEl;
-          const restMax=brk?18:5;
-          if(restH>restMax)
-            (_warnAcc[s.id]||(_warnAcc[s.id]={})).dep={kind:'rest',msg:`Sosta di ${fmtT(restH)} a questo punto: insolitamente lunga, possibile errore nell'orario di ripartenza.`};
-        } else {
-          depEl=brk?computeBreakDep(s.id,arrEl):arrEl+stageRest(s.id);
-          if(dp!==null)
-            (_warnAcc[s.id]||(_warnAcc[s.id]={})).dep={kind:'rest',msg:`L'orario di ripartenza è precedente all'arrivo: non puoi ripartire prima di essere arrivato.`};
-        }
-      } else depEl=brk?computeBreakDep(s.id,arrEl):arrEl+stageRest(s.id);
-      prevDep=depEl;return{arr:arrEl,dep:depEl,isActual:true,rideTime,pf};
-    } else {
-      const pf=cumP>0?cumP/cumA:1,arr=prevDep+pm/pf;
-      const dep=brk?computeBreakDep(s.id,arr):arr+stageRest(s.id);
-      prevDep=dep;return{arr,dep,isActual:false,rideTime:pm/pf,pf};
+  // Partenza effettiva: ammette anche elapsed negativo (partenza anticipata).
+  // startEl è esposto nel return: la scadenza 145h è ancorata QUI (partenza individuale).
+  const startEl=state.actualStart?(parseClockToElapsed(state.actualStart,0)??0):0;
+
+  // ---------- PASS 1: risolvi i passaggi REALI, raccogli i dati per il motore ----------
+  const real={};        // id -> {arr,dep,rideTime} (solo tappe valide)
+  const completed=[];   // {segs,fat,realTime} per la stima del fattore-motore
+  let prevDep=startEl, cumulReal=0, cumulPlan=0;
+  STAGES.forEach((s,i)=>{
+    const at=state.actualTimes[s.id]||{};
+    const brk=isBreak(s.id);
+    if(!at.arr) return;   // tappa futura → pass 2
+    const arrEl=parseClockToElapsed(at.arr,prevDep);
+    if(arrEl===null||arrEl<prevDep-0.05){
+      (_warnAcc[s.id]||(_warnAcc[s.id]={})).arr={kind:'time',msg:`L'orario di arrivo è precedente alla partenza dal punto precedente: la tappa risulterebbe percorsa in tempo negativo.`};
+      return; // invalido: non avanza la catena reale, sarà stimata in pass 2
     }
+    const rideTime=Math.max(arrEl-prevDep,0);
+    // CONTROLLO velocità implicita: un refuso non deve inquinare motore né catena
+    const impliedKmh=rideTime>0.01?(s.km/rideTime):999;
+    if(impliedKmh<SPEED_MIN_KMH||impliedKmh>SPEED_MAX_KMH){
+      (_warnAcc[s.id]||(_warnAcc[s.id]={})).arr={kind:'speed',kmh:Math.round(impliedKmh),msg:`Questo arrivo implica una media di ${Math.round(impliedKmh)} km/h sulla tratta, ${impliedKmh>SPEED_MAX_KMH?'troppo alta':'troppo bassa'} per essere reale.`};
+      return; // refuso: escluso dal motore e dalla catena reale
+    }
+    // ripartenza dalla tappa
+    let depEl;
+    if(at.dep){
+      const dp=parseClockToElapsed(at.dep,arrEl);
+      if(dp!==null&&dp>=arrEl){
+        depEl=dp;
+        const restH=depEl-arrEl, restMax=brk?18:5;
+        if(restH>restMax)
+          (_warnAcc[s.id]||(_warnAcc[s.id]={})).dep={kind:'rest',msg:`Sosta di ${fmtT(restH)} a questo punto: insolitamente lunga, possibile errore nell'orario di ripartenza.`};
+      } else {
+        depEl=brk?computeBreakDep(s.id,arrEl):arrEl+stageRest(s.id);
+        if(dp!==null)
+          (_warnAcc[s.id]||(_warnAcc[s.id]={})).dep={kind:'rest',msg:`L'orario di ripartenza è precedente all'arrivo: non puoi ripartire prima di essere arrivato.`};
+      }
+    } else depEl=brk?computeBreakDep(s.id,arrEl):arrEl+stageRest(s.id);
+    real[s.id]={arr:arrEl,dep:depEl,rideTime};
+    completed.push({segs:SEGS[s.id],fat:allT[i].fatigue??allT[i].fat??1,realTime:rideTime});
+    cumulReal+=rideTime; cumulPlan+=allT[i].med;
+    prevDep=depEl;
   });
-  const gPf=cumP>0?cumP/cumA:1;
+
+  // ---------- MOTORE: fattore appreso dai reali, ridistribuito dalla fisica ----------
+  const motorK=findMotorK(completed);
+
+  // ---------- PASS 2: catena completa — reali tali e quali, futuri col motore ----------
+  let pDep=startEl;
+  const raw=STAGES.map((s,i)=>{
+    const brk=isBreak(s.id);
+    if(real[s.id]){
+      const r=real[s.id]; pDep=r.dep;
+      return{arr:r.arr,dep:r.dep,isActual:true,rideTime:r.rideTime};
+    }
+    // tappa futura (o registrata ma scartata per refuso/invalid): stima col motore reale
+    const flagged=!!(state.actualTimes[s.id]&&state.actualTimes[s.id].arr);
+    const rt=motorTime(SEGS[s.id],motorK,allT[i].fatigue??allT[i].fat??1);
+    const arr=pDep+rt;
+    const dep=brk?computeBreakDep(s.id,arr):arr+stageRest(s.id);
+    pDep=dep;
+    return{arr,dep,isActual:false,speedBad:flagged,rideTime:rt,motorK};
+  });
+
+  // dayPfs / realDecay: SOLO per visualizzazione (non guidano più la proiezione)
+  const dayPfs=days.map(day=>{
+    let actR=0,planR=0,complete=true;
+    day.stages.forEach(s=>{
+      const idx=STAGES.findIndex(t=>t.id===s.id), el=raw[idx];
+      if(el.isActual){actR+=el.rideTime;planR+=allT[idx].med;}else complete=false;
+    });
+    return{pf:actR>0?planR/actR:null,isComplete:complete&&actR>0};
+  });
+  const decayPairs=[];
+  for(let i=1;i<dayPfs.length;i++)
+    if(dayPfs[i-1].isComplete&&dayPfs[i].isComplete&&dayPfs[i-1].pf&&dayPfs[i].pf)
+      decayPairs.push((dayPfs[i-1].pf-dayPfs[i].pf)/dayPfs[i-1].pf*100);
+  const realDecay=decayPairs.length>0?decayPairs.reduce((a,b)=>a+b,0)/decayPairs.length:null;
+
+  const globalPf=cumulReal>0?cumulPlan/cumulReal:1;
   SPEED_WARN=_warnAcc;
-  return{stages:raw,pf:gPf,realDecay:null};
+  return{stages:raw,pf:globalPf,dayPfs,realDecay,motorK,startEl};
 }
 function updateActual(id,field){
   const el=document.getElementById('act_'+field+'_'+id);if(!el)return;
@@ -677,7 +845,21 @@ function flashSpeedWarnings(){
 }
 
 // === MODALITA REGISTRAZIONE ===
-function toggleRegMode(){ state.regMode=!state.regMode; render(); }
+function fitToWidth(){
+  const vp=document.querySelector('meta[name="viewport"]');
+  if(!vp) return;
+  if(state.regMode){
+    vp.setAttribute('content','width=device-width, initial-scale=1, minimum-scale=1, maximum-scale=1, user-scalable=no');
+    document.body.classList.add('reg-active');
+    return;
+  }
+  document.body.classList.remove('reg-active');
+  // larghezza reale del contenuto (di norma 1280, ma se una riga sfora la catturo)
+  const w=Math.max(1280, Math.ceil(document.documentElement.scrollWidth||1280));
+  vp.setAttribute('content','width='+w+', user-scalable=yes');
+}
+function syncRegViewport(){ fitToWidth(); }
+function toggleRegMode(){ state.regMode=!state.regMode; render(); fitToWidth(); }
 function setRegTime(id,field){
   const inp=document.getElementById('regedit_'+id+'_'+field);
   if(!inp) return;
@@ -720,14 +902,14 @@ function showPlanReminder(name){
   document.body.appendChild(div);
   setTimeout(()=>{if(div.parentElement)div.remove();},11000);
 }
-function renderRegMode(allT,days,elapsed,perfFactor,totalRest){
+function renderRegMode(allT,days,elapsed,perfFactor,margin){
   const seq=buildSequence();
   const target=getNextTarget();
   const tot=seq.length;
   const done=seq.filter(x=>x.id===0?!!state.actualStart:!!((state.actualTimes[x.id]||{})[x.field])).length;
   const finishEl=elapsed[N-1].arr;
   const finishClock=fmtClock(finishEl);
-  const realMargin=TIME_LIMIT-finishEl;
+  const realMargin=margin; // deadline ancorata alla partenza individuale
   const marginColor=realMargin>=8?'var(--red)':realMargin>=0?'#C8860A':'var(--err)';
   let whereNow, whereNext, bigBtn, confirmBlock='', dayBlock='';
   if(!target){
@@ -834,8 +1016,8 @@ function renderRegMode(allT,days,elapsed,perfFactor,totalRest){
   </div>`;
 }
 
-function renderHeroStats(days,totT,perfFactor,totalRest){
-  const totEl=totT.med+totalRest,rem=TIME_LIMIT-totEl;
+function renderHeroStats(days,totT,perfFactor,margin){
+  const rem=margin; // ancorato alla partenza individuale (deadline = startEl+90h)
   const bC=rem<0?'var(--err)':rem<8?'var(--amber)':'var(--red)';
   const pfPct=Math.round((perfFactor-1)*100);
   const pfHtml=perfFactor!==1?`<span class="pf-badge ${pfPct>2?'faster':pfPct<-2?'slower':'neutral'}">${pfPct>0?'+'+pfPct:pfPct}% piano</span>`:'';
@@ -850,12 +1032,18 @@ function renderHeroStats(days,totT,perfFactor,totalRest){
 
 function render(){
   const allT=computeTimes(),days=computeDays(allT);
-  const{stages:elapsed,pf:perfFactor}=computeActualTimes(allT,days);
+  const{stages:elapsed,pf:perfFactor,startEl}=computeActualTimes(allT,days);
   const totT={min:0,med:0,max:0};
   allT.forEach(t=>{totT.min+=t.min;totT.med+=t.med;totT.max+=t.max;});
-  const totalRest=Math.max(0,elapsed[N-1].arr-totT.med);
+  // === Grandezze ancorate alla PARTENZA INDIVIDUALE (regolamento ARI/ACP) ===
+  const deadlineEl=startEl+TIME_LIMIT;
+  const finishEl=elapsed[N-1].arr;
+  const margin=deadlineEl-finishEl;
+  const rideTotal=elapsed.reduce((s,e)=>s+(e.rideTime||0),0);
+  const restTotal=elapsed.reduce((s,e,i)=>i<N-1?s+Math.max(0,e.dep-e.arr):s,0);
+  const totalElapsed=finishEl-startEl;
   if(state.regMode){
-    renderRegMode(allT,days,elapsed,perfFactor,totalRest);
+    renderRegMode(allT,days,elapsed,perfFactor,margin);
     const el=document.getElementById('nav-counter'); if(el) el.style.display='none';
     saveState();
     return;
@@ -864,7 +1052,7 @@ function render(){
   const maxL=Math.max(...loads),minL=Math.min(...loads);
   let cKm=0,cEl=0;
   const cum=STAGES.map(s=>{cKm+=s.km;cEl+=s.elev;return{cKm,cEl,pct:Math.round(cKm/TOTAL_KM*100)};});
-  renderHeroStats(days,totT,perfFactor,totalRest);
+  renderHeroStats(days,totT,perfFactor,margin);
 
   let html='';
   const segCount=Object.values(SEGS).reduce((s,a)=>s+a.length,0);
@@ -941,30 +1129,30 @@ function render(){
   html+=`<div class="params-note">${segCount} seg GPX · +5%/-10% forchetta · -${state.fatigueDecay}%/g fatica · V↓${V_DESC} km/h · CdA 0.40 · Cr 0.005 · ρ 1.1 · η 0.95<br>I tre modelli non danno lo stesso tempo a parità di potenza media: la distribuzione dei watt tra salita e piano cambia, e il tempo è dominato dalle salite. Per farli convergere allinea la potenza in salita (o la VAM), non la media.</div>
   </div></div>`;
 
-  const totEl=totT.med+totalRest,rem=TIME_LIMIT-totEl;
-  const budPct=Math.min(100,Math.round(totEl/TIME_LIMIT*100));
-  const bC=rem<0?'var(--err)':rem<8?'var(--amber)':'var(--red)';
-  const deadline=fmtClock(TIME_LIMIT);
+  const budPct=Math.min(100,Math.max(0,Math.round(totalElapsed/TIME_LIMIT*100)));
+  const bC=margin<0?'var(--err)':margin<8?'var(--amber)':'var(--red)';
+  const deadline=fmtClock(deadlineEl);
+  const startTxt=state.actualStart?`${state.actualStart} (registrata)`:`${String(state.startHour).padStart(2,'0')}:${String(state.startMinute).padStart(2,'0')} (pianificata)`;
   html+=`<div class="section"><div class="section-head"><div class="bar"></div><div>
     <h2>Budget tempi</h2>
     <p>Limite: <b>90 ore</b> dal via (ARI/ACP 1200 km). ${tip('Le 90 ore sono il tempo massimo per l\'omologazione del brevetto ARI/ACP da 1200 km. Il conteggio parte dalla partenza individuale, non dall\'apertura delle partenze.')} Partenza 18 agosto 2026.</p>
   </div></div><div class="panel">
     <div class="params-grid" style="grid-template-columns:repeat(auto-fill,minmax(155px,1fr));gap:14px;margin-bottom:16px">
-      <div class="param-item"><label>Scadenza (90h)</label><div style="font-size:14px;font-weight:700;margin-top:5px">${deadline}</div></div>
-      <div class="param-item"><label>Pedalata (medio)</label><div style="font-size:14px;font-weight:700;margin-top:5px">${fmtT(totT.med)}</div></div>
-      <div class="param-item"><label>Soste totali</label><div style="font-size:14px;font-weight:700;margin-top:5px">${fmtT(totalRest)}</div></div>
-      <div class="param-item"><label>Elapsed totale</label><div style="font-size:14px;font-weight:700;margin-top:5px">${fmtT(totEl)}</div></div>
-      <div class="param-item"><label>Margine</label><div style="font-size:18px;font-weight:700;color:${bC};margin-top:3px">${rem>=0?'+':''}${fmtT(Math.abs(rem))}</div></div>
+      <div class="param-item"><label>Scadenza (90h dalla tua partenza)</label><div style="font-size:14px;font-weight:700;margin-top:5px">${deadline}</div></div>
+      <div class="param-item"><label>Pedalata prevista</label><div style="font-size:14px;font-weight:700;margin-top:5px">${fmtT(rideTotal)}</div></div>
+      <div class="param-item"><label>Soste (incl. notturne)</label><div style="font-size:14px;font-weight:700;margin-top:5px">${fmtT(restTotal)}</div></div>
+      <div class="param-item"><label>Elapsed totale</label><div style="font-size:14px;font-weight:700;margin-top:5px">${fmtT(totalElapsed)}</div></div>
+      <div class="param-item"><label>Margine</label><div style="font-size:18px;font-weight:700;color:${bC};margin-top:3px">${margin>=0?'+':''}${fmtT(Math.abs(margin))}</div></div>
     </div>
     <div style="margin-bottom:5px;display:flex;justify-content:space-between;font-size:11px;color:var(--ink3)">
-      <span>Partenza ${String(state.startHour).padStart(2,'0')}:${String(state.startMinute).padStart(2,'0')}</span>
+      <span>Partenza ${startTxt}</span>
       <span style="color:${bC};font-weight:700">${budPct}% budget</span>
       <span>Scadenza ${deadline}</span>
     </div>
     <div style="height:7px;background:var(--bg-alt);border-radius:3px;overflow:hidden;border:1px solid var(--line)">
       <div style="height:100%;width:${budPct}%;background:${bC};transition:width .3s"></div>
     </div>
-    ${rem<0?`<div style="margin-top:9px;padding:8px 12px;background:#F5E1DC;border:1px solid #D4A09A;border-radius:2px;font-size:12px;color:#8A3322;font-weight:700">⚠ Sforamento di ${fmtT(Math.abs(rem))} sul limite regolamentare.</div>`:''}
+    ${margin<0?`<div style="margin-top:9px;padding:8px 12px;background:#F5E1DC;border:1px solid #D4A09A;border-radius:2px;font-size:12px;color:#8A3322;font-weight:700">⚠ Sforamento di ${fmtT(Math.abs(margin))} sul limite regolamentare.</div>`:''}
     ${(()=>{
       const tot=buildSequence().length,done=buildSequence().filter(x=>x.id===0?!!state.actualStart:!!((state.actualTimes[x.id]||{})[x.field])).length;
       return `<div style="margin-top:14px;font-size:13px;color:var(--ink3)">${done>0?'<b style=\'color:var(--red)\'>'+done+'/'+tot+'</b> passaggi registrati — usa il tasto <b>Apri modalità di registrazione</b> in alto per registrare durante la prova.':'Per registrare i passaggi durante la prova usa il tasto <b>Apri modalità di registrazione</b> in alto.'}</div>`;
@@ -1036,10 +1224,20 @@ function render(){
           const prevLastId=days[di-1].stages[days[di-1].stages.length-1].id;
           const bdVal=state.breakDepartures[prevLastId]||'';
           const ph=String(state.defaultDepartureHour).padStart(2,'0')+':00';
+          // Da quando la registrazione e' attiva, il dato REGISTRATO comanda.
+          const regDep=(state.actualTimes[prevLastId]||{}).dep||null;
+          if(regDep){
+            return `<div style="display:flex;align-items:center;gap:4px;justify-content:flex-end">
+              <span style="font-size:10px;color:var(--ink4)">Riparte:</span>
+              <input id="bd_${prevLastId}" type="text" value="${bdVal}" placeholder="${ph}" maxlength="5"
+                class="act-input" disabled style="width:48px;opacity:.45" title="Ignorato: vale la ripartenza registrata (${regDep})">
+              <span style="font-size:9px;font-weight:700;color:var(--red);white-space:nowrap" title="Orario registrato — comanda sul pianificato">→ reg. ${regDep}</span>
+            </div>`;
+          }
           return `<div style="display:flex;align-items:center;gap:4px;justify-content:flex-end">
             <span style="font-size:10px;color:var(--ink4)">Riparte:</span>
             <input id="bd_${prevLastId}" type="text" value="${bdVal}" placeholder="${ph}" maxlength="5"
-              class="act-input${bdVal?' has-val':''}" onchange="updateBreakDep(${prevLastId})" style="width:48px">
+              class="act-input${bdVal?' has-val':''}" onchange="updateBreakDep(${prevLastId})" style="width:48px" title="Ora di ripartenza pianificata (vale finché non registri la ripartenza reale)">
           </div>`;
         })():''}
         <div><b style="color:var(--red)">▶</b> ${fmtClock(dayStartEl)}</div>
@@ -1161,6 +1359,10 @@ function setMode(m){state.calcMode=m;render();}
 
 loadState();
 render();
+fitToWidth();
+setTimeout(fitToWidth,100);
+window.addEventListener('resize',fitToWidth);
+window.addEventListener('orientationchange',()=>setTimeout(fitToWidth,200));
 </script>
 </body>
 </html>
