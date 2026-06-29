@@ -203,6 +203,22 @@ footer a { color: var(--gold); text-decoration: none; }
 footer a:hover { color: #fff; }
 body.reg-active { min-width:0; }
 body.reg-active .reg-screen { width:100vw; max-width:100vw; }
+
+/* ===== PAUSA BUTTON ===== */
+.pause-btn { display:flex; align-items:center; justify-content:center; gap:10px;
+  background:#E8A020; color:#fff; border:none; border-radius:12px; cursor:pointer;
+  font-family:var(--font); font-weight:700; font-size:18px; padding:16px 24px;
+  width:100%; transition:background .2s; }
+.pause-btn:active { background:#C07010; }
+.pause-btn.is-paused { background:#E84020; animation:pulse-pause 1.5s infinite; }
+@keyframes pulse-pause { 0%,100%{opacity:1} 50%{opacity:.7} }
+.pause-bar { display:flex; align-items:center; gap:12px; padding:10px 16px;
+  background:#FFF3CD; border-radius:8px; margin-top:12px; }
+.pause-bar.active { background:#FFEEDD; border:2px solid #E8A020; }
+.pause-accum { font-size:13px; color:#7A4F00; font-weight:600; }
+.pause-badge { font-size:11px; background:#E8A020; color:#fff; border-radius:999px;
+  padding:2px 8px; font-weight:700; }
+
 </style>
 </head>
 <body>
@@ -613,7 +629,8 @@ function computeActualTimes(allT,days){
       (_warnAcc[s.id]||(_warnAcc[s.id]={})).arr={kind:'time',msg:`L'orario di arrivo è precedente alla partenza dal punto precedente: la tappa risulterebbe percorsa in tempo negativo.`};
       return; // invalido: non avanza la catena reale, sarà stimata in pass 2
     }
-    const rideTime=Math.max(arrEl-prevDep,0);
+    const pauseH=(state.stagePauses&&state.stagePauses[s.id])||0;
+    const rideTime=Math.max(arrEl-prevDep-pauseH,0);
     // CONTROLLO velocità implicita: un refuso non deve inquinare motore né catena
     const impliedKmh=rideTime>0.01?(s.km/rideTime):999;
     if(impliedKmh<SPEED_MIN_KMH||impliedKmh>SPEED_MAX_KMH){
@@ -751,6 +768,7 @@ function _stateToObj(){
     fatigueDecay:state.fatigueDecay, defaultRestMin:state.defaultRestMin,
     startHour:state.startHour, startMinute:state.startMinute, defaultDepartureHour:state.defaultDepartureHour,
     stageRests:state.stageRests, breakDepartures:state.breakDepartures, actualTimes:state.actualTimes,
+    stagePauses:state.stagePauses||{},
     actualStart:state.actualStart, regMode:state.regMode,
   };
 }
@@ -859,6 +877,80 @@ function fitToWidth(){
   vp.setAttribute('content','width='+w+', user-scalable=yes');
 }
 function syncRegViewport(){ fitToWidth(); }
+
+// ===== GESTIONE PAUSA =====
+// La pausa permette di sottrarre soste non pianificate (bar, meccanico, fontanella)
+// dal rideTime: il motorK impara solo dalla velocità di pedalata reale.
+let _pauseTimerInterval = null;
+
+function getTotalPauseMs(){
+  let ms = state.pauseAccumMs || 0;
+  if(state.pauseActive && state.pauseStartMs) ms += Date.now() - state.pauseStartMs;
+  return ms;
+}
+
+function fmtPauseMs(ms){
+  const tot = Math.floor(ms / 1000);
+  const m = Math.floor(tot / 60), s = tot % 60;
+  return m > 0 ? m + 'm ' + String(s).padStart(2,'0') + 's' : s + 's';
+}
+
+function currentTravelStageId(){
+  // La tappa in corso = prima senza arrivo registrato
+  for(const s of STAGES){
+    const at = state.actualTimes[s.id] || {};
+    if(!at.arr) return s.id;
+  }
+  return null;
+}
+
+function togglePause(){
+  if(!state.pauseActive){
+    // Avvio pausa
+    state.pauseActive = true;
+    state.pauseStartMs = Date.now();
+    state.pauseForId = currentTravelStageId();
+    // Timer live — aggiorna solo il contatore, non ri-renderizza tutto
+    _pauseTimerInterval = setInterval(()=>{
+      const el = document.getElementById('pause-live-counter');
+      if(el) el.textContent = fmtPauseMs(getTotalPauseMs());
+    }, 1000);
+  } else {
+    // Riprendo
+    clearInterval(_pauseTimerInterval); _pauseTimerInterval = null;
+    state.pauseAccumMs = (state.pauseAccumMs || 0) + (Date.now() - state.pauseStartMs);
+    state.pauseStartMs = null;
+    state.pauseActive = false;
+  }
+  render();
+}
+
+function resetPause(){
+  clearInterval(_pauseTimerInterval); _pauseTimerInterval = null;
+  state.pauseActive = false;
+  state.pauseStartMs = null;
+  state.pauseAccumMs = 0;
+  state.pauseForId = null;
+}
+
+function savePauseForStage(stageId){
+  // Chiamata quando si conferma un arrivo: salva la pausa accumulata e resetta
+  if(!stageId) return;
+  const h = getTotalPauseMs() / 3600000;
+  if(h > 0.001){ // ignora pause < ~4 secondi (tocco accidentale)
+    if(!state.stagePauses) state.stagePauses = {};
+    state.stagePauses[stageId] = (state.stagePauses[stageId] || 0) + h;
+  }
+  resetPause();
+}
+
+function undoPause(stageId){
+  if(!state.stagePauses) return;
+  delete state.stagePauses[stageId];
+  render();
+}
+// ===== FINE GESTIONE PAUSA =====
+
 function toggleRegMode(){ state.regMode=!state.regMode; render(); fitToWidth(); }
 function setRegTime(id,field){
   const inp=document.getElementById('regedit_'+id+'_'+field);
@@ -980,6 +1072,33 @@ function renderRegMode(allT,days,elapsed,perfFactor,margin){
     : (target && target.id!==0 && target.field==='dep')
       ? fmtClock(elapsed[STAGES.findIndex(s=>s.id===target.id)].dep)
       : '—';
+  // ===== BLOCCO PAUSA =====
+  let pauseBlock = '';
+  if(target && target.id!==0 && target.field==='arr'){
+    const paMs = getTotalPauseMs();
+    const pauseMin = Math.round(paMs/60000);
+    const savedPause = state.stagePauses && state.stagePauses[target.id] ? state.stagePauses[target.id] : 0;
+    const savedMin = Math.round(savedPause * 60);
+    if(state.pauseActive){
+      pauseBlock = `<div class="pause-bar active">
+        <button class="pause-btn is-paused" onclick="togglePause()" style="width:auto;padding:12px 20px;font-size:16px">▶ RIPRENDI</button>
+        <div style="flex:1">
+          <div style="font-size:11px;color:#7A4F00;font-weight:600">⏸ PAUSA IN CORSO</div>
+          <div id="pause-live-counter" style="font-size:20px;font-weight:700;color:#E84020">${fmtPauseMs(paMs)}</div>
+        </div>
+      </div>`;
+    } else {
+      pauseBlock = `<div class="pause-bar${paMs>0?' active':''}" style="margin-top:8px">
+        <button class="pause-btn" onclick="togglePause()" style="width:auto;padding:12px 20px;font-size:16px">⏸ PAUSA</button>
+        <div style="flex:1;font-size:12px;color:#7A4F00">
+          ${paMs > 0 ? '<span class=\'pause-accum\'>Pausa accumulata: <b>' + fmtPauseMs(paMs) + '</b></span><br>' : ''}
+          ${savedMin > 0 ? '<span style=\'color:var(--ink3)\'>Tappa precedente: −' + savedMin + 'm sottratti</span>' : '<span style=\'color:var(--ink4)\'>Premi per mettere in pausa il cronometro</span>'}
+        </div>
+      </div>`;
+    }
+  }
+  // ===== FINE BLOCCO PAUSA =====
+
   document.getElementById('app').innerHTML=`
   <div class="reg-screen">
     <div class="reg-top">
@@ -1006,6 +1125,7 @@ function renderRegMode(allT,days,elapsed,perfFactor,margin){
         </div>
       </div>
       ${bigBtn}
+      ${pauseBlock}
       ${confirmBlock}
       ${dayBlock}
       <div class="reg-progress">${done}/${tot} passaggi registrati</div>
